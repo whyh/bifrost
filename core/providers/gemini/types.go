@@ -2416,6 +2416,15 @@ type GeminiFileDeleteRequest struct {
 	FileID string `json:"file_id"`
 }
 
+// GeminiCountTokensRequest represents the request body for Google Gemini's count tokens API.
+// The endpoint accepts either bare contents or a generateContentRequest envelope; only the
+// envelope can carry the system instruction and tools, so both shapes are parsed here.
+type GeminiCountTokensRequest struct {
+	Model                  string                   `json:"-"` // Resolved from the request path, not the body
+	Contents               []Content                `json:"contents,omitempty"`
+	GenerateContentRequest *GeminiGenerationRequest `json:"generateContentRequest,omitempty"`
+}
+
 // GeminiCountTokensResponse represents the response from Google Gemini's count tokens API.
 type GeminiCountTokensResponse struct {
 	// Response from models.countTokens

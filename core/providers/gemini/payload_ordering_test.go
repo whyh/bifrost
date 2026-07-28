@@ -80,3 +80,96 @@ func TestNormalizeRawGenerateContentRequestForCompatibility(t *testing.T) {
 		assert.Equal(t, `{"contents":[{"parts":[{"text":"keep"}]}]}`, string(got))
 	})
 }
+
+// TestWrapGeminiCountTokensBody covers the countTokens envelope. The endpoint rejects
+// systemInstruction/tools/toolConfig/generationConfig at the top level and silently
+// ignores a top-level contents/model once generateContentRequest is set, so the body
+// must carry the envelope and nothing beside it.
+func TestWrapGeminiCountTokensBody(t *testing.T) {
+	t.Run("wraps a flat body and keeps every counted field", func(t *testing.T) {
+		raw := []byte(`{"model":"gemini-3.6-flash","contents":[{"role":"user","parts":[{"text":"hi"}]}],"systemInstruction":{"parts":[{"text":"be terse"}]},"tools":[{"functionDeclarations":[{"name":"probe"}]}],"toolConfig":{"functionCallingConfig":{"mode":"AUTO"}},"generationConfig":{"temperature":0.2}}`)
+
+		got := wrapGeminiCountTokensBody(raw, "gemini-3.6-flash")
+
+		assert.JSONEq(t, `{"generateContentRequest":{"model":"models/gemini-3.6-flash","contents":[{"role":"user","parts":[{"text":"hi"}]}],"systemInstruction":{"parts":[{"text":"be terse"}]},"tools":[{"functionDeclarations":[{"name":"probe"}]}],"toolConfig":{"functionCallingConfig":{"mode":"AUTO"}},"generationConfig":{"temperature":0.2}}}`, string(got))
+	})
+
+	t.Run("leaves nothing at the top level besides the envelope", func(t *testing.T) {
+		got := wrapGeminiCountTokensBody([]byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`), "gemini-3.6-flash")
+
+		require.True(t, providerUtils.JSONFieldExists(got, "generateContentRequest"))
+		assert.False(t, providerUtils.JSONFieldExists(got, "contents"))
+		assert.False(t, providerUtils.JSONFieldExists(got, "model"))
+	})
+
+	t.Run("does not double wrap an already enveloped body", func(t *testing.T) {
+		raw := []byte(`{"generateContentRequest":{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"systemInstruction":{"parts":[{"text":"be terse"}]}}}`)
+
+		got := wrapGeminiCountTokensBody(raw, "gemini-3.6-flash")
+
+		assert.JSONEq(t, `{"generateContentRequest":{"model":"models/gemini-3.6-flash","contents":[{"role":"user","parts":[{"text":"hi"}]}],"systemInstruction":{"parts":[{"text":"be terse"}]}}}`, string(got))
+		assert.False(t, providerUtils.JSONFieldExists(got, "generateContentRequest.generateContentRequest"))
+	})
+
+	t.Run("qualifies the model without doubling the prefix", func(t *testing.T) {
+		got := wrapGeminiCountTokensBody([]byte(`{"contents":[]}`), "models/gemini-3.6-flash")
+
+		assert.Equal(t, "models/gemini-3.6-flash", providerUtils.GetJSONField(got, "generateContentRequest.model").String())
+	})
+
+	t.Run("strips fields GenerateContentRequest does not define", func(t *testing.T) {
+		raw := []byte(`{"contents":[],"labels":{"a":"b"},"fallbacks":["gemini/other"]}`)
+
+		got := wrapGeminiCountTokensBody(raw, "gemini-3.6-flash")
+
+		assert.False(t, providerUtils.JSONFieldExists(got, "generateContentRequest.labels"))
+		assert.False(t, providerUtils.JSONFieldExists(got, "generateContentRequest.fallbacks"))
+	})
+
+	t.Run("handles empty body", func(t *testing.T) {
+		assert.Empty(t, wrapGeminiCountTokensBody(nil, "gemini-3.6-flash"))
+	})
+}
+
+// TestGeminiCountTokensRequestToGenerationRequest covers the genai ingress: clients may
+// post bare contents or the documented generateContentRequest envelope, and only the
+// latter can carry a system instruction.
+func TestGeminiCountTokensRequestToGenerationRequest(t *testing.T) {
+	t.Run("unwraps the envelope and keeps the system instruction", func(t *testing.T) {
+		req := &GeminiCountTokensRequest{
+			Model: "gemini-3.6-flash",
+			GenerateContentRequest: &GeminiGenerationRequest{
+				Contents:          []Content{{Role: "user", Parts: []*Part{{Text: "hi"}}}},
+				SystemInstruction: &Content{Parts: []*Part{{Text: "be terse"}}},
+			},
+		}
+
+		got := req.ToGeminiGenerationRequest()
+
+		require.NotNil(t, got.SystemInstruction)
+		assert.Equal(t, "be terse", got.SystemInstruction.Parts[0].Text)
+		assert.Equal(t, "gemini-3.6-flash", got.Model)
+		assert.True(t, got.IsCountTokens)
+	})
+
+	t.Run("falls back to bare contents", func(t *testing.T) {
+		req := &GeminiCountTokensRequest{
+			Model:    "gemini-3.6-flash",
+			Contents: []Content{{Role: "user", Parts: []*Part{{Text: "hi"}}}},
+		}
+
+		got := req.ToGeminiGenerationRequest()
+
+		require.Len(t, got.Contents, 1)
+		assert.Equal(t, "hi", got.Contents[0].Parts[0].Text)
+	})
+
+	t.Run("path model wins over the envelope model", func(t *testing.T) {
+		req := &GeminiCountTokensRequest{
+			Model:                  "gemini-3.6-flash",
+			GenerateContentRequest: &GeminiGenerationRequest{Model: "models/stale"},
+		}
+
+		assert.Equal(t, "gemini-3.6-flash", req.ToGeminiGenerationRequest().Model)
+	})
+}
