@@ -65,6 +65,11 @@ var enterprisePlugins = []string{
 	"kafka",
 }
 
+// vkReloadLogThreshold is the total duration at or above which the virtual key
+// reload summary is logged at Info instead of Debug. The reload runs inline on
+// an interactive save, so a second is already worth surfacing.
+const vkReloadLogThreshold = 1 * time.Second
+
 // ServerCallbacks is a interface that defines the callbacks for the server.
 type ServerCallbacks interface {
 	// Plugins callbacks
@@ -403,8 +408,17 @@ func (s *BifrostHTTPServer) getGovernancePlugin() (governance.BaseGovernancePlug
 	return lib.FindPluginAs[governance.BaseGovernancePlugin](s.Config, s.getGovernancePluginName())
 }
 
-// ReloadVirtualKey reloads a virtual key from the in-memory store
+// ReloadVirtualKey reloads a virtual key from the in-memory store.
+//
+// Timed per stage because this runs inline on the virtual key save request. The
+// first stage in particular can sleep: RetryOnNotFound is configured here with
+// DBLookupMaxRetries attempts at twice DBLookupDelay, so a virtual key that
+// reads as not-found adds seconds of latency before this function does any
+// work at all.
 func (s *BifrostHTTPServer) ReloadVirtualKey(ctx context.Context, id string) (*tables.TableVirtualKey, error) {
+	timer := governance.NewStageTimer("[vk-reload-timing]")
+	timer.Field("vk", id)
+	defer timer.Log(logger, vkReloadLogThreshold)
 	// Load relationships for response
 	preloadedVk, err := s.Config.ConfigStore.RetryOnNotFound(ctx, func(ctx context.Context) (any, error) {
 		preloadedVk, err := s.Config.ConfigStore.GetVirtualKey(ctx, id)
@@ -413,6 +427,7 @@ func (s *BifrostHTTPServer) ReloadVirtualKey(ctx context.Context, id string) (*t
 		}
 		return preloadedVk, nil
 	}, lib.DBLookupMaxRetries, 2*lib.DBLookupDelay)
+	timer.Mark("vk_read")
 	if err != nil {
 		logger.Error("failed to load virtual key: %v", err)
 		return nil, err
@@ -439,6 +454,7 @@ func (s *BifrostHTTPServer) ReloadVirtualKey(ctx context.Context, id string) (*t
 	mcs, err := s.Config.ConfigStore.GetModelConfigsByScopeAndScopeIDs(
 		ctx, tables.ModelConfigScopeVirtualKey, []string{id},
 	)
+	timer.Mark("model_config_read")
 	if err != nil {
 		return virtualKey, fmt.Errorf("failed to reload VK-scoped model configs for VK %s: %w", id, err)
 	}
@@ -467,7 +483,11 @@ func (s *BifrostHTTPServer) ReloadVirtualKey(ctx context.Context, id string) (*t
 	for mcID := range staleIDs {
 		store.DeleteModelConfigInMemory(ctx, mcID)
 	}
+	timer.Mark("memory_upsert")
+	// Rebuilds this key's tool list under the MCP handler's global mutex, so it
+	// serialises against every other virtual key doing the same.
 	s.MCPServerHandler.SyncVKMCPServer(virtualKey)
+	timer.Mark("mcp_sync")
 	return virtualKey, nil
 }
 

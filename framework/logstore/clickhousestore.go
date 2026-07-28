@@ -45,6 +45,27 @@ type ClickHouseLogStore struct {
 // chRMWShards is the number of RMW lock shards; keys are hashed onto them.
 const chRMWShards = 128
 
+// chRMWBatchChunk bounds how many rows a single batch insert locks at once.
+// A batch is written under lockRMWBatch across two network round trips (the
+// existence filter, then the insert). With the default MaxBatchSize of 1000
+// against 128 shards, one unchunked batch locks effectively every shard, so it
+// behaves as a global lock and stalls every concurrent Update — the object-storage
+// upload workers and deferred-usage updaters in particular. Chunking keeps the
+// held-shard set small enough that those callers interleave.
+const chRMWBatchChunk = 128
+
+// forEachRMWChunk applies fn to successive slices of at most chRMWBatchChunk
+// entries, stopping at the first error.
+func forEachRMWChunk[T any](entries []T, fn func([]T) error) error {
+	for start := 0; start < len(entries); start += chRMWBatchChunk {
+		end := min(start+chRMWBatchChunk, len(entries))
+		if err := fn(entries[start:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func chRMWShard(table, id string) int {
 	h := fnv.New32a()
 	h.Write([]byte(table))
@@ -252,22 +273,24 @@ func (s *ClickHouseLogStore) BatchCreateIfNotExists(ctx context.Context, entries
 	if len(entries) == 0 {
 		return nil
 	}
-	ids := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if e != nil {
-			ids = append(ids, e.ID)
+	return forEachRMWChunk(entries, func(chunk []*Log) error {
+		ids := make([]string, 0, len(chunk))
+		for _, e := range chunk {
+			if e != nil {
+				ids = append(ids, e.ID)
+			}
 		}
-	}
-	defer s.lockRMWBatch("logs", ids)()
-	missing, err := chFilterMissing(ctx, s.db, "logs", entries, func(l *Log) string { return l.ID }, func(l *Log) time.Time { return l.Timestamp })
-	if err != nil {
-		return err
-	}
-	if len(missing) == 0 {
-		return nil
-	}
-	// Omit inc_number so ClickHouse's DEFAULT generateSnowflakeID() fires.
-	return s.db.WithContext(ctx).Omit("inc_number").Create(&missing).Error
+		defer s.lockRMWBatch("logs", ids)()
+		missing, err := chFilterMissing(ctx, s.db, "logs", chunk, func(l *Log) string { return l.ID }, func(l *Log) time.Time { return l.Timestamp })
+		if err != nil {
+			return err
+		}
+		if len(missing) == 0 {
+			return nil
+		}
+		// Omit inc_number so ClickHouse's DEFAULT generateSnowflakeID() fires.
+		return s.db.WithContext(ctx).Omit("inc_number").Create(&missing).Error
+	})
 }
 
 // BatchCreateMCPToolLogsIfNotExists inserts the MCP tool log entries whose
@@ -276,22 +299,24 @@ func (s *ClickHouseLogStore) BatchCreateMCPToolLogsIfNotExists(ctx context.Conte
 	if len(entries) == 0 {
 		return nil
 	}
-	ids := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if e != nil {
-			ids = append(ids, e.ID)
+	return forEachRMWChunk(entries, func(chunk []*MCPToolLog) error {
+		ids := make([]string, 0, len(chunk))
+		for _, e := range chunk {
+			if e != nil {
+				ids = append(ids, e.ID)
+			}
 		}
-	}
-	defer s.lockRMWBatch("mcp_tool_logs", ids)()
-	missing, err := chFilterMissing(ctx, s.db, "mcp_tool_logs", entries, func(l *MCPToolLog) string { return l.ID }, func(l *MCPToolLog) time.Time { return l.Timestamp })
-	if err != nil {
-		return err
-	}
-	if len(missing) == 0 {
-		return nil
-	}
-	// Omit inc_number so ClickHouse's DEFAULT generateSnowflakeID() fires.
-	return s.db.WithContext(ctx).Omit("inc_number").Create(&missing).Error
+		defer s.lockRMWBatch("mcp_tool_logs", ids)()
+		missing, err := chFilterMissing(ctx, s.db, "mcp_tool_logs", chunk, func(l *MCPToolLog) string { return l.ID }, func(l *MCPToolLog) time.Time { return l.Timestamp })
+		if err != nil {
+			return err
+		}
+		if len(missing) == 0 {
+			return nil
+		}
+		// Omit inc_number so ClickHouse's DEFAULT generateSnowflakeID() fires.
+		return s.db.WithContext(ctx).Omit("inc_number").Create(&missing).Error
+	})
 }
 
 // --- Updates (read-modify-write + re-insert) ---

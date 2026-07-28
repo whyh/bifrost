@@ -35,6 +35,12 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+// vkSaveLogThreshold is the total request duration at or above which the
+// virtual key save summary is logged at Info instead of Debug. A save is an
+// interactive action, so anything reaching a second is worth surfacing without
+// enabling debug logging for the whole process.
+const vkSaveLogThreshold = 1 * time.Second
+
 // dbForUpdate adds a PostgreSQL row-level update lock to the query.
 func dbForUpdate(db *gorm.DB) *gorm.DB {
 	if db.Dialector.Name() != "postgres" {
@@ -631,8 +637,11 @@ type vkModelConfigDesired struct {
 // handling: true treats perProvider as the full desired set (reconciling and removing absent
 // providers); false leaves all per-provider configs untouched (for a partial VK update that
 // omits provider_configs).
-func (h *GovernanceHandler) syncVKGovernanceToModelConfigs(ctx context.Context, tx *gorm.DB, vk *configstoreTables.TableVirtualKey, top vkModelConfigDesired, perProvider []vkModelConfigDesired, reconcileProviders bool) error {
-	if err := h.reconcileVKModelConfig(ctx, tx, vk, top); err != nil {
+// The timer is optional and may be nil (the create path passes nil); it records
+// one stage per reconciled config plus the provider sweep, so a slow save can be
+// attributed to a specific statement rather than to this function as a whole.
+func (h *GovernanceHandler) syncVKGovernanceToModelConfigs(ctx context.Context, tx *gorm.DB, vk *configstoreTables.TableVirtualKey, top vkModelConfigDesired, perProvider []vkModelConfigDesired, reconcileProviders bool, timer *governance.StageTimer) error {
+	if err := h.reconcileVKModelConfig(ctx, tx, vk, top, timer); err != nil {
 		return err
 	}
 	if !reconcileProviders {
@@ -644,7 +653,7 @@ func (h *GovernanceHandler) syncVKGovernanceToModelConfigs(ctx context.Context, 
 			continue
 		}
 		keep[*pg.provider] = true
-		if err := h.reconcileVKModelConfig(ctx, tx, vk, pg); err != nil {
+		if err := h.reconcileVKModelConfig(ctx, tx, vk, pg, timer); err != nil {
 			return err
 		}
 	}
@@ -656,6 +665,7 @@ func (h *GovernanceHandler) syncVKGovernanceToModelConfigs(ctx context.Context, 
 		Find(&existing).Error; err != nil {
 		return err
 	}
+	timer.Mark("gs.sweep_query")
 	for i := range existing {
 		mc := &existing[i]
 		if mc.Provider != nil && !keep[*mc.Provider] {
@@ -664,11 +674,19 @@ func (h *GovernanceHandler) syncVKGovernanceToModelConfigs(ctx context.Context, 
 			}
 		}
 	}
+	timer.Mark("gs.sweep_delete")
 	return nil
 }
 
 // reconcileVKModelConfig reconciles a single VK-scoped model config to the desired state.
-func (h *GovernanceHandler) reconcileVKModelConfig(ctx context.Context, tx *gorm.DB, vk *configstoreTables.TableVirtualKey, d vkModelConfigDesired) error {
+// The timer is optional and may be nil; each stage it records is prefixed with the
+// config being reconciled ("top" or the provider name) so that a save touching
+// several providers reports where the time went per provider.
+func (h *GovernanceHandler) reconcileVKModelConfig(ctx context.Context, tx *gorm.DB, vk *configstoreTables.TableVirtualKey, d vkModelConfigDesired, timer *governance.StageTimer) error {
+	stage := "top"
+	if d.provider != nil {
+		stage = *d.provider
+	}
 	q := tx.Preload("Budgets").Where("scope = ? AND scope_id = ? AND model_name = ?",
 		configstoreTables.ModelConfigScopeVirtualKey, vk.ID, configstoreTables.ModelConfigAllModels)
 	if d.provider == nil {
@@ -680,6 +698,7 @@ func (h *GovernanceHandler) reconcileVKModelConfig(ctx context.Context, tx *gorm
 	if err := q.Limit(1).Find(&existingList).Error; err != nil {
 		return err
 	}
+	timer.Mark(stage + ".lookup")
 	isNew := len(existingList) == 0
 
 	var mc configstoreTables.TableModelConfig
@@ -746,6 +765,8 @@ func (h *GovernanceHandler) reconcileVKModelConfig(ctx context.Context, tx *gorm
 		}
 	}
 
+	timer.Mark(stage + ".ratelimit")
+
 	// Resulting budget count: the desired set if provided, else the existing set.
 	finalBudgetCount := len(mc.Budgets)
 	if d.budgetsProvided {
@@ -770,10 +791,13 @@ func (h *GovernanceHandler) reconcileVKModelConfig(ctx context.Context, tx *gorm
 				return err
 			}
 		}
+		timer.Mark(stage + ".drop")
 		return nil
 	}
 
 	// Persist the mc (create or update) before touching budgets, which FK to it.
+	// UpdateModelConfig takes a SELECT ... FOR UPDATE on the row before saving, so
+	// this stage covers lock acquisition as well as the write itself.
 	if isNew {
 		if err := h.configStore.CreateModelConfig(ctx, &mc, tx); err != nil {
 			return err
@@ -784,18 +808,21 @@ func (h *GovernanceHandler) reconcileVKModelConfig(ctx context.Context, tx *gorm
 			return err
 		}
 	}
+	timer.Mark(stage + ".mcwrite")
 
 	if d.budgetsProvided {
 		if err := h.reconcileModelConfigBudgets(ctx, tx, &mc, d.budgets); err != nil {
 			return err
 		}
 	}
+	timer.Mark(stage + ".budgets")
 
 	if rateLimitIDToDelete != "" {
 		if err := tx.Delete(&configstoreTables.TableRateLimit{}, "id = ?", rateLimitIDToDelete).Error; err != nil {
 			return err
 		}
 	}
+	timer.Mark(stage + ".rldelete")
 	return nil
 }
 
@@ -1427,7 +1454,7 @@ func (h *GovernanceHandler) createVirtualKey(ctx *fasthttp.RequestCtx) {
 			budgets:           req.Budgets,
 			rateLimitProvided: req.RateLimit != nil,
 			rateLimit:         topRateLimit,
-		}, vkGovProviders, true); err != nil {
+		}, vkGovProviders, true, nil); err != nil {
 			return err
 		}
 		if req.MCPConfigs != nil {
@@ -1622,9 +1649,20 @@ func (h *GovernanceHandler) mutateVirtualKeyBudgetOverride(ctx *fasthttp.Request
 	})
 }
 
-// updateVirtualKey handles PUT /api/governance/virtual-keys/{vk_id} - Update a virtual key
+// updateVirtualKey handles PUT /api/governance/virtual-keys/{vk_id} - Update a virtual key.
+//
+// The request is staged and timed end to end. A save does far more than write
+// the virtual key row: it takes a row lock that contends with the governance
+// dump cycle, rewrites the VK-scoped model configs and their budgets, reloads
+// in-memory state across the cluster, and reconciles per-user credentials. Any
+// one of those can dominate, and none of them is separable from the others in
+// a plain request-duration metric. The deferred summary reports every stage,
+// including on the error paths that return early.
 func (h *GovernanceHandler) updateVirtualKey(ctx *fasthttp.RequestCtx) {
+	timer := governance.NewStageTimer("[vk-save-timing]")
+	defer timer.Log(logger, vkSaveLogThreshold)
 	vkID := ctx.UserValue("vk_id").(string)
+	timer.Field("vk", vkID)
 	var req UpdateVirtualKeyRequest
 	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
 		SendError(ctx, 400, "Invalid JSON")
@@ -1666,6 +1704,7 @@ func (h *GovernanceHandler) updateVirtualKey(ctx *fasthttp.RequestCtx) {
 			return
 		}
 	}
+	timer.Mark("preflight")
 	if err := h.configStore.ExecuteTransaction(ctx, func(tx *gorm.DB) error {
 		var rateLimitIDToDelete string
 		var providerBudgetIDsToDelete []string
@@ -1681,6 +1720,10 @@ func (h *GovernanceHandler) updateVirtualKey(ctx *fasthttp.RequestCtx) {
 			}
 			return err
 		}
+		// Marked separately from the rest of the transaction because this is a
+		// SELECT ... FOR UPDATE on rows the governance dump cycle rewrites in
+		// bulk every tick. Time spent here is lock wait, not work.
+		timer.Mark("lock")
 		vk = &lockedVK
 		sort.Slice(vk.Budgets, func(i, j int) bool {
 			if vk.Budgets[i].ResetDuration == vk.Budgets[j].ResetDuration {
@@ -1907,9 +1950,11 @@ func (h *GovernanceHandler) updateVirtualKey(ctx *fasthttp.RequestCtx) {
 				top.rateLimit = rateLimitFromRequestFields(req.RateLimit.TokenMaxLimit, req.RateLimit.TokenResetDuration, req.RateLimit.RequestMaxLimit, req.RateLimit.RequestResetDuration)
 			}
 		}
-		if err := h.syncVKGovernanceToModelConfigs(ctx, tx, vk, top, vkGovProviders, req.ProviderConfigs != nil); err != nil {
+		timer.Mark("provider_reconcile")
+		if err := h.syncVKGovernanceToModelConfigs(ctx, tx, vk, top, vkGovProviders, req.ProviderConfigs != nil, timer); err != nil {
 			return err
 		}
+		timer.Mark("govsync")
 		if req.MCPConfigs != nil {
 			// Check for duplicate MCPClientName values among all configs before processing
 			seenMCPClientNames := make(map[string]bool)
@@ -2021,6 +2066,7 @@ func (h *GovernanceHandler) updateVirtualKey(ctx *fasthttp.RequestCtx) {
 		SendError(ctx, 500, fmt.Sprintf("Failed to update virtual key: %v", err))
 		return
 	}
+	timer.Mark("txcommit")
 	// Load relationships for response
 	preloadedVk, err := h.configStore.GetVirtualKey(ctx, vk.ID)
 	if err != nil {
@@ -2029,12 +2075,14 @@ func (h *GovernanceHandler) updateVirtualKey(ctx *fasthttp.RequestCtx) {
 	}
 	// Reverse-map governance from VK-scoped model configs for display.
 	h.hydrateVKGovernance(ctx, preloadedVk)
+	timer.Mark("reload_read")
 	if _, err := h.governanceManager.ReloadVirtualKey(ctx, vk.ID); err != nil {
 		// Should never happen but just in case
 		logger.Error("failed to reload virtual key after update: %v", err)
 		SendError(ctx, 500, "Virtual key updated in database but failed to reload in-memory state")
 		return
 	}
+	timer.Mark("reload")
 
 	// Per-user credential reconciliation when the VK's MCP allowlist
 	// changed. Mirrors the AP-propagation path: enterprise orphans /
@@ -2049,6 +2097,7 @@ func (h *GovernanceHandler) updateVirtualKey(ctx *fasthttp.RequestCtx) {
 			logger.Error("reconcile per-user-headers credentials after VK %s update failed: %v", vk.ID, err)
 		}
 	}
+	timer.Mark("reconcile")
 
 	SendJSON(ctx, map[string]interface{}{
 		"message":     "Virtual key updated successfully",

@@ -5675,12 +5675,22 @@ func (s *RDBConfigStore) ExecuteTransaction(ctx context.Context, fn func(tx *gor
 	return s.DB().WithContext(ctx).Transaction(fn)
 }
 
-// RetryOnNotFound retries a function up to 3 times with 1-second delays if it returns ErrNotFound
+// RetryOnNotFound retries a function up to maxRetries times, sleeping retryDelay
+// between attempts, whenever it returns ErrNotFound.
+//
+// Each retry is logged because the sleeps are otherwise invisible. Callers on
+// interactive request paths pass budgets large enough to add seconds of
+// latency, and a not-found that is not transient burns the whole budget before
+// failing. Without these lines a slow request looks like slow work rather than
+// waiting.
 func (s *RDBConfigStore) RetryOnNotFound(ctx context.Context, fn func(ctx context.Context) (any, error), maxRetries int, retryDelay time.Duration) (any, error) {
 	var lastErr error
 	for attempt := range maxRetries {
 		result, err := fn(ctx)
 		if err == nil {
+			if attempt > 0 && s.logger != nil {
+				s.logger.Warn("RetryOnNotFound: succeeded on attempt %d/%d after waiting %s", attempt+1, maxRetries, time.Duration(attempt)*retryDelay)
+			}
 			return result, nil
 		}
 		if !errors.Is(err, ErrNotFound) && !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -5691,6 +5701,9 @@ func (s *RDBConfigStore) RetryOnNotFound(ctx context.Context, fn func(ctx contex
 
 		// Don't wait after the last attempt
 		if attempt < maxRetries-1 {
+			if s.logger != nil {
+				s.logger.Warn("RetryOnNotFound: attempt %d/%d returned not-found, sleeping %s before retry", attempt+1, maxRetries, retryDelay)
+			}
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -5698,6 +5711,9 @@ func (s *RDBConfigStore) RetryOnNotFound(ctx context.Context, fn func(ctx contex
 				// Continue to next retry
 			}
 		}
+	}
+	if s.logger != nil {
+		s.logger.Warn("RetryOnNotFound: exhausted %d attempts over %s, returning not-found", maxRetries, time.Duration(maxRetries-1)*retryDelay)
 	}
 	return nil, lastErr
 }
